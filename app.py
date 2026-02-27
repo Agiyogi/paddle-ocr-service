@@ -14,6 +14,8 @@ import io
 import base64
 import logging
 import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,6 +24,10 @@ app = FastAPI(title="PaddleOCR Service", version="1.0.0")
 
 # Initialize PaddleOCR once at startup
 ocr_engine = None
+
+# Thread pool for concurrent OCR — set to match vCPUs
+# c5.xlarge = 4, c5.2xlarge = 8
+thread_pool = ThreadPoolExecutor(max_workers=4)
 
 MAX_IMAGE_SIZE = 2000  # Resize images to this max dimension
 
@@ -149,7 +155,8 @@ async def ocr_endpoint(req: OCRRequest):
         raise HTTPException(status_code=400, detail=f"Failed to load image: {str(e)}")
 
     max_size = req.max_size or MAX_IMAGE_SIZE
-    return run_paddle_ocr(image, max_size)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(thread_pool, run_paddle_ocr, image, max_size)
 
 
 @app.post("/orientation")
@@ -169,8 +176,9 @@ async def orientation_endpoint(req: OCRRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load image: {str(e)}")
 
-    start = time.time()
-    ocr_result = run_paddle_ocr(image)
+    max_size = req.max_size or MAX_IMAGE_SIZE
+    loop = asyncio.get_event_loop()
+    ocr_result = await loop.run_in_executor(thread_pool, run_paddle_ocr, image, max_size)
 
     horizontal_count = 0
     vertical_count = 0
@@ -196,15 +204,13 @@ async def orientation_endpoint(req: OCRRequest):
             needs_rotation = True
             suggested_rotation = 90
 
-    elapsed = (time.time() - start) * 1000
-
     return {
         "needs_rotation": needs_rotation,
         "suggested_rotation": suggested_rotation,
         "horizontal_words": horizontal_count,
         "vertical_words": vertical_count,
         "word_count": ocr_result.word_count,
-        "processing_time_ms": round(elapsed, 1),
+        "processing_time_ms": ocr_result.processing_time_ms,
     }
 
 
