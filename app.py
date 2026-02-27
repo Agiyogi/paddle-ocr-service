@@ -5,7 +5,7 @@ Replaces Google Vision OCR for text extraction and orientation detection.
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List, Dict
+from typing import Optional, List
 from paddleocr import PaddleOCR
 from PIL import Image
 import numpy as np
@@ -20,20 +20,22 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="PaddleOCR Service", version="1.0.0")
 
-# Initialize PaddleOCR once at startup (English, CPU mode)
+# Initialize PaddleOCR once at startup
 ocr_engine = None
+
+MAX_IMAGE_SIZE = 2000  # Resize images to this max dimension
+
 
 @app.on_event("startup")
 def load_model():
     global ocr_engine
     logger.info("Loading PaddleOCR model...")
     ocr_engine = PaddleOCR(
-        use_angle_cls=True,  # Enable orientation detection
-        lang='en',
-        use_gpu=False,
-        show_log=False,
-        det_db_thresh=0.3,
-        det_db_box_thresh=0.5,
+        text_detection_model_name='PP-OCRv4_mobile_det',
+        text_recognition_model_name='en_PP-OCRv4_mobile_rec',
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
     )
     logger.info("PaddleOCR model loaded successfully")
 
@@ -41,6 +43,7 @@ def load_model():
 class OCRRequest(BaseModel):
     image_url: Optional[str] = None
     image_base64: Optional[str] = None
+    max_size: Optional[int] = None  # Override default max image size
 
 
 class WordBox(BaseModel):
@@ -50,7 +53,6 @@ class WordBox(BaseModel):
     y: int
     x2: int
     y2: int
-    box: List[List[float]]  # Full 4-point polygon
 
 
 class OCRResponse(BaseModel):
@@ -75,43 +77,60 @@ def decode_base64_image(b64_string: str) -> Image.Image:
     return Image.open(io.BytesIO(image_bytes)).convert('RGB')
 
 
-def run_paddle_ocr(image: Image.Image) -> OCRResponse:
+def run_paddle_ocr(image: Image.Image, max_size: int = MAX_IMAGE_SIZE) -> OCRResponse:
     """Run PaddleOCR on a PIL image and return standardised results."""
     start = time.time()
-    
+
+    # Resize large images
+    original_width, original_height = image.size
+    image.thumbnail((max_size, max_size))
+    resized_width, resized_height = image.size
+
+    # Calculate scale factor for mapping coords back to original
+    scale_x = original_width / resized_width
+    scale_y = original_height / resized_height
+
     img_array = np.array(image)
-    result = ocr_engine.ocr(img_array, cls=True)
-    
+    result = list(ocr_engine.predict(img_array))
+
     words = []
-    if result and result[0]:
-        for line in result[0]:
-            box = line[0]  # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-            text = line[1][0]
-            confidence = float(line[1][1])
-            
-            # Convert 4-point polygon to bounding rect
-            xs = [p[0] for p in box]
-            ys = [p[1] for p in box]
-            
+    if result and len(result) > 0:
+        ocr_result = result[0]
+
+        # Handle both dict-like and object-like access
+        if hasattr(ocr_result, 'rec_texts'):
+            texts = ocr_result.rec_texts
+            scores = ocr_result.rec_scores
+            polys = ocr_result.dt_polys
+        elif isinstance(ocr_result, dict):
+            texts = ocr_result.get('rec_texts', [])
+            scores = ocr_result.get('rec_scores', [])
+            polys = ocr_result.get('dt_polys', [])
+        else:
+            texts, scores, polys = [], [], []
+
+        for i, (text, score, poly) in enumerate(zip(texts, scores, polys)):
+            poly_array = np.array(poly)
+            xs = poly_array[:, 0]
+            ys = poly_array[:, 1]
+
             words.append(WordBox(
                 text=text,
-                confidence=confidence,
-                x=int(min(xs)),
-                y=int(min(ys)),
-                x2=int(max(xs)),
-                y2=int(max(ys)),
-                box=box,
+                confidence=float(score),
+                x=int(min(xs) * scale_x),
+                y=int(min(ys) * scale_y),
+                x2=int(max(xs) * scale_x),
+                y2=int(max(ys) * scale_y),
             ))
-    
+
     elapsed = (time.time() - start) * 1000
-    width, height = image.size
-    
+
     return OCRResponse(
         words=words,
         word_count=len(words),
         processing_time_ms=round(elapsed, 1),
-        image_width=width,
-        image_height=height,
+        image_width=original_width,
+        image_height=original_height,
     )
 
 
@@ -120,7 +139,7 @@ async def ocr_endpoint(req: OCRRequest):
     """Run OCR on an image (URL or base64)."""
     if not req.image_url and not req.image_base64:
         raise HTTPException(status_code=400, detail="Provide image_url or image_base64")
-    
+
     try:
         if req.image_url:
             image = download_image(req.image_url)
@@ -128,19 +147,20 @@ async def ocr_endpoint(req: OCRRequest):
             image = decode_base64_image(req.image_base64)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load image: {str(e)}")
-    
-    return run_paddle_ocr(image)
+
+    max_size = req.max_size or MAX_IMAGE_SIZE
+    return run_paddle_ocr(image, max_size)
 
 
 @app.post("/orientation")
 async def orientation_endpoint(req: OCRRequest):
     """
     Quick orientation check — returns whether image needs rotation.
-    Uses PaddleOCR's angle classifier.
+    Analyses word bounding box aspect ratios.
     """
     if not req.image_url and not req.image_base64:
         raise HTTPException(status_code=400, detail="Provide image_url or image_base64")
-    
+
     try:
         if req.image_url:
             image = download_image(req.image_url)
@@ -148,14 +168,13 @@ async def orientation_endpoint(req: OCRRequest):
             image = decode_base64_image(req.image_base64)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load image: {str(e)}")
-    
+
     start = time.time()
     ocr_result = run_paddle_ocr(image)
-    
-    # Analyse word boxes for orientation
+
     horizontal_count = 0
     vertical_count = 0
-    
+
     for word in ocr_result.words:
         width = abs(word.x2 - word.x)
         height = abs(word.y2 - word.y)
@@ -166,19 +185,19 @@ async def orientation_endpoint(req: OCRRequest):
             horizontal_count += 1
         elif aspect < 0.8:
             vertical_count += 1
-    
+
     total = horizontal_count + vertical_count
     needs_rotation = False
     suggested_rotation = 0
-    
+
     if total > 0:
         vertical_ratio = vertical_count / total
         if vertical_ratio > 0.4:
             needs_rotation = True
-            suggested_rotation = 90  # Could be 90 or 270, needs further analysis
-    
+            suggested_rotation = 90
+
     elapsed = (time.time() - start) * 1000
-    
+
     return {
         "needs_rotation": needs_rotation,
         "suggested_rotation": suggested_rotation,
