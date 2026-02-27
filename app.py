@@ -37,11 +37,10 @@ def load_model():
     global ocr_engine
     logger.info("Loading PaddleOCR model...")
     ocr_engine = PaddleOCR(
-        text_detection_model_name='PP-OCRv4_mobile_det',
-        text_recognition_model_name='en_PP-OCRv4_mobile_rec',
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
+        lang='en',
+        use_angle_cls=False,
+        use_gpu=False,
+        show_log=False,
     )
     logger.info("PaddleOCR model loaded successfully")
 
@@ -49,7 +48,7 @@ def load_model():
 class OCRRequest(BaseModel):
     image_url: Optional[str] = None
     image_base64: Optional[str] = None
-    max_size: Optional[int] = None  # Override default max image size
+    max_size: Optional[int] = None
 
 
 class WordBox(BaseModel):
@@ -70,7 +69,6 @@ class OCRResponse(BaseModel):
 
 
 def download_image(url: str, timeout: int = 30) -> Image.Image:
-    """Download image from URL and return as PIL Image."""
     response = requests.get(url, timeout=timeout)
     if response.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Failed to download image: HTTP {response.status_code}")
@@ -78,56 +76,70 @@ def download_image(url: str, timeout: int = 30) -> Image.Image:
 
 
 def decode_base64_image(b64_string: str) -> Image.Image:
-    """Decode base64 string to PIL Image."""
     image_bytes = base64.b64decode(b64_string)
     return Image.open(io.BytesIO(image_bytes)).convert('RGB')
 
 
 def run_paddle_ocr(image: Image.Image, max_size: int = MAX_IMAGE_SIZE) -> OCRResponse:
-    """Run PaddleOCR on a PIL image and return standardised results."""
     start = time.time()
 
-    # Resize large images
     original_width, original_height = image.size
     image.thumbnail((max_size, max_size))
     resized_width, resized_height = image.size
 
-    # Calculate scale factor for mapping coords back to original
     scale_x = original_width / resized_width
     scale_y = original_height / resized_height
 
     img_array = np.array(image)
-    result = list(ocr_engine.predict(img_array))
+
+    # PaddleOCR v2 uses .ocr(), v3 uses .predict()
+    if hasattr(ocr_engine, 'predict'):
+        raw = list(ocr_engine.predict(img_array))
+    else:
+        raw = ocr_engine.ocr(img_array, cls=False)
 
     words = []
-    if result and len(result) > 0:
-        ocr_result = result[0]
 
-        # Handle both dict-like and object-like access
-        if hasattr(ocr_result, 'rec_texts'):
-            texts = ocr_result.rec_texts
-            scores = ocr_result.rec_scores
-            polys = ocr_result.dt_polys
-        elif isinstance(ocr_result, dict):
-            texts = ocr_result.get('rec_texts', [])
-            scores = ocr_result.get('rec_scores', [])
-            polys = ocr_result.get('dt_polys', [])
-        else:
-            texts, scores, polys = [], [], []
+    if raw and len(raw) > 0:
+        page_result = raw[0]
+        if page_result is None:
+            page_result = []
 
-        for i, (text, score, poly) in enumerate(zip(texts, scores, polys)):
-            poly_array = np.array(poly)
-            xs = poly_array[:, 0]
-            ys = poly_array[:, 1]
-
-            words.append(WordBox(
-                text=text,
-                confidence=float(score),
-                x=int(min(xs) * scale_x),
-                y=int(min(ys) * scale_y),
-                x2=int(max(xs) * scale_x),
-                y2=int(max(ys) * scale_y),
-            ))
+        # v3 object format
+        if hasattr(page_result, 'rec_texts'):
+            for text, score, poly in zip(page_result.rec_texts, page_result.rec_scores, page_result.dt_polys):
+                poly_array = np.array(poly)
+                xs, ys = poly_array[:, 0], poly_array[:, 1]
+                words.append(WordBox(
+                    text=text, confidence=float(score),
+                    x=int(min(xs) * scale_x), y=int(min(ys) * scale_y),
+                    x2=int(max(xs) * scale_x), y2=int(max(ys) * scale_y),
+                ))
+        # v3 dict format
+        elif isinstance(page_result, dict) and 'rec_texts' in page_result:
+            for text, score, poly in zip(page_result['rec_texts'], page_result['rec_scores'], page_result['dt_polys']):
+                poly_array = np.array(poly)
+                xs, ys = poly_array[:, 0], poly_array[:, 1]
+                words.append(WordBox(
+                    text=text, confidence=float(score),
+                    x=int(min(xs) * scale_x), y=int(min(ys) * scale_y),
+                    x2=int(max(xs) * scale_x), y2=int(max(ys) * scale_y),
+                ))
+        # v2 format: list of [bbox, (text, confidence)]
+        elif isinstance(page_result, list):
+            for line in page_result:
+                if line is None:
+                    continue
+                bbox = line[0]
+                text = line[1][0]
+                confidence = line[1][1]
+                poly_array = np.array(bbox)
+                xs, ys = poly_array[:, 0], poly_array[:, 1]
+                words.append(WordBox(
+                    text=text, confidence=float(confidence),
+                    x=int(min(xs) * scale_x), y=int(min(ys) * scale_y),
+                    x2=int(max(xs) * scale_x), y2=int(max(ys) * scale_y),
+                ))
 
     elapsed = (time.time() - start) * 1000
 
@@ -142,7 +154,6 @@ def run_paddle_ocr(image: Image.Image, max_size: int = MAX_IMAGE_SIZE) -> OCRRes
 
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr_endpoint(req: OCRRequest):
-    """Run OCR on an image (URL or base64)."""
     if not req.image_url and not req.image_base64:
         raise HTTPException(status_code=400, detail="Provide image_url or image_base64")
 
@@ -161,10 +172,6 @@ async def ocr_endpoint(req: OCRRequest):
 
 @app.post("/orientation")
 async def orientation_endpoint(req: OCRRequest):
-    """
-    Quick orientation check — returns whether image needs rotation.
-    Analyses word bounding box aspect ratios.
-    """
     if not req.image_url and not req.image_base64:
         raise HTTPException(status_code=400, detail="Provide image_url or image_base64")
 
