@@ -1,8 +1,9 @@
 """
-PaddleOCR Service v1.2.0 - Word-level detection
-================================================
-Upgraded to PaddleOCR v3 + PP-OCRv5 for word-level bounding boxes.
-This matches Google Vision's word-level output for anchor compatibility.
+PaddleOCR Service v1.3.0 - Word-level detection with mobile models
+===================================================================
+PP-OCRv5 mobile det + mobile rec for fast word-level bounding boxes.
+Auto-rotation via doc orientation classification.
+Unwarping enabled for book curvature correction.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -22,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PaddleOCR Service", version="1.2.0")
+app = FastAPI(title="PaddleOCR Service", version="1.3.0")
 
 # Initialize PaddleOCR once at startup
 ocr_engine = None
@@ -39,8 +40,12 @@ def load_model():
     logger.info("Loading PaddleOCR v3 model with word-level detection...")
     ocr_engine = PaddleOCR(
         lang='en',
-        use_angle_cls=False,
         return_word_box=True,
+        text_detection_model_name='PP-OCRv5_mobile_det',
+        text_recognition_model_name='en_PP-OCRv5_mobile_rec',
+        use_doc_orientation_classify=True,
+        use_doc_unwarping=True,
+        use_textline_orientation=False,
     )
     logger.info("PaddleOCR model loaded successfully")
 
@@ -66,6 +71,7 @@ class OCRResponse(BaseModel):
     processing_time_ms: float
     image_width: int
     image_height: int
+    rotation_angle: int = 0
 
 
 def download_image(url: str, timeout: int = 30) -> Image.Image:
@@ -92,56 +98,60 @@ def run_paddle_ocr(image: Image.Image, max_size: int = MAX_IMAGE_SIZE) -> OCRRes
 
     img_array = np.array(image)
 
-    # PaddleOCR v3 uses .predict()
     raw = list(ocr_engine.predict(img_array, return_word_box=True))
 
     words = []
+    rotation_angle = 0
 
     if raw and len(raw) > 0:
         page_result = raw[0]
         if page_result is None:
             page_result = {}
 
-        # v3 returns an object or dict with rec_texts, dt_polys,
-        # and word-level: text_word, text_word_boxes
         result_dict = None
 
-        # Try object attribute access first
         if hasattr(page_result, 'json') and page_result.json:
             result_dict = page_result.json.get('res', {})
         elif hasattr(page_result, 'text_word'):
-            # Direct attribute access
             result_dict = {
                 'text_word': page_result.text_word,
                 'text_word_boxes': page_result.text_word_boxes,
                 'rec_texts': getattr(page_result, 'rec_texts', []),
                 'rec_scores': getattr(page_result, 'rec_scores', []),
                 'dt_polys': getattr(page_result, 'dt_polys', []),
+                'doc_preprocessor_res': getattr(page_result, 'doc_preprocessor_res', {}),
             }
         elif isinstance(page_result, dict):
             result_dict = page_result.get('res', page_result)
 
         if result_dict:
-            # Try word-level output first (from return_word_box=True)
+            # Get rotation angle from orientation classifier
+            doc_res = result_dict.get('doc_preprocessor_res', {})
+            if isinstance(doc_res, dict):
+                rotation_angle = doc_res.get('angle', 0)
+                if rotation_angle == -1:
+                    rotation_angle = 0
+
+            # If image was rotated, recalculate scale based on corrected dimensions
+            if rotation_angle in (90, 270):
+                scale_x = original_height / resized_height
+                scale_y = original_width / resized_width
+
             text_words = result_dict.get('text_word', [])
             text_word_boxes = result_dict.get('text_word_boxes', [])
 
             if text_words and text_word_boxes:
-                # Word-level data available
-                logger.info(f"Using word-level output: {sum(len(line_words) for line_words in text_words)} words")
-                
-                # text_word is list of lists: [[words_in_line1], [words_in_line2], ...]
-                # text_word_boxes matches the same structure
+                total_words = sum(len(lw) for lw in text_words)
+                logger.info(f"Word-level output: {total_words} words, rotation: {rotation_angle}°")
+
                 rec_scores = result_dict.get('rec_scores', [])
-                
+
                 for line_idx, (line_words, line_boxes) in enumerate(zip(text_words, text_word_boxes)):
-                    # Get line-level confidence as fallback
                     line_conf = float(rec_scores[line_idx]) if line_idx < len(rec_scores) else 0.0
-                    
+
                     for word_text, word_box in zip(line_words, line_boxes):
                         if not word_text.strip():
                             continue
-                        # word_box is [x1, y1, x2, y2]
                         bx1, by1, bx2, by2 = word_box[0], word_box[1], word_box[2], word_box[3]
                         words.append(WordBox(
                             text=word_text.strip(),
@@ -152,7 +162,6 @@ def run_paddle_ocr(image: Image.Image, max_size: int = MAX_IMAGE_SIZE) -> OCRRes
                             y2=int(by2 * scale_y),
                         ))
             else:
-                # Fallback to line-level output
                 logger.info("Word-level not available, falling back to line-level")
                 rec_texts = result_dict.get('rec_texts', [])
                 rec_scores = result_dict.get('rec_scores', [])
@@ -180,6 +189,7 @@ def run_paddle_ocr(image: Image.Image, max_size: int = MAX_IMAGE_SIZE) -> OCRRes
         processing_time_ms=round(elapsed, 1),
         image_width=original_width,
         image_height=original_height,
+        rotation_angle=rotation_angle,
     )
 
 
@@ -201,57 +211,6 @@ async def ocr_endpoint(req: OCRRequest):
     return await loop.run_in_executor(thread_pool, run_paddle_ocr, image, max_size)
 
 
-@app.post("/orientation")
-async def orientation_endpoint(req: OCRRequest):
-    if not req.image_url and not req.image_base64:
-        raise HTTPException(status_code=400, detail="Provide image_url or image_base64")
-
-    try:
-        if req.image_url:
-            image = download_image(req.image_url)
-        else:
-            image = decode_base64_image(req.image_base64)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to load image: {str(e)}")
-
-    max_size = req.max_size or MAX_IMAGE_SIZE
-    loop = asyncio.get_event_loop()
-    ocr_result = await loop.run_in_executor(thread_pool, run_paddle_ocr, image, max_size)
-
-    horizontal_count = 0
-    vertical_count = 0
-
-    for word in ocr_result.words:
-        width = abs(word.x2 - word.x)
-        height = abs(word.y2 - word.y)
-        if height == 0:
-            continue
-        aspect = width / height
-        if aspect > 1.2:
-            horizontal_count += 1
-        elif aspect < 0.8:
-            vertical_count += 1
-
-    total = horizontal_count + vertical_count
-    needs_rotation = False
-    suggested_rotation = 0
-
-    if total > 0:
-        vertical_ratio = vertical_count / total
-        if vertical_ratio > 0.4:
-            needs_rotation = True
-            suggested_rotation = 90
-
-    return {
-        "needs_rotation": needs_rotation,
-        "suggested_rotation": suggested_rotation,
-        "horizontal_words": horizontal_count,
-        "vertical_words": vertical_count,
-        "word_count": ocr_result.word_count,
-        "processing_time_ms": ocr_result.processing_time_ms,
-    }
-
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "engine": "paddleocr", "version": "1.2.0", "word_level": True}
+    return {"status": "ok", "engine": "paddleocr", "version": "1.3.0", "word_level": True}

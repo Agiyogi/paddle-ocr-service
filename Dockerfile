@@ -14,8 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-# Pre-download PaddleOCR v3 models at build time so startup is fast
-RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(lang='en', return_word_box=True)"
+# Pre-download PaddleOCR v3 mobile models at build time
+RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(lang='en', return_word_box=True, text_detection_model_name='PP-OCRv5_mobile_det', text_recognition_model_name='en_PP-OCRv5_mobile_rec', use_doc_orientation_classify=True, use_doc_unwarping=True, use_textline_orientation=False)"
 
 EXPOSE 8000
 
