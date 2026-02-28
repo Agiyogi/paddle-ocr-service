@@ -14,9 +14,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-# Pre-download PaddleOCR models at build time so startup is fast
-RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, show_log=False)"
+# Pre-download PaddleOCR v3 models at build time so startup is fast
+RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(lang='en', return_word_box=True)"
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
