@@ -40,8 +40,6 @@ def load_model():
     ocr_engine = PaddleOCR(
         lang='en',
         use_angle_cls=False,
-        use_gpu=False,
-        show_log=False,
         return_word_box=True,
     )
     logger.info("PaddleOCR model loaded successfully")
@@ -143,15 +141,15 @@ def run_paddle_ocr(image: Image.Image, max_size: int = MAX_IMAGE_SIZE) -> OCRRes
                     for word_text, word_box in zip(line_words, line_boxes):
                         if not word_text.strip():
                             continue
-                        poly = np.array(word_box)
-                        xs, ys = poly[:, 0], poly[:, 1]
+                        # word_box is [x1, y1, x2, y2]
+                        bx1, by1, bx2, by2 = word_box[0], word_box[1], word_box[2], word_box[3]
                         words.append(WordBox(
                             text=word_text.strip(),
                             confidence=line_conf,
-                            x=int(min(xs) * scale_x),
-                            y=int(min(ys) * scale_y),
-                            x2=int(max(xs) * scale_x),
-                            y2=int(max(ys) * scale_y),
+                            x=int(bx1 * scale_x),
+                            y=int(by1 * scale_y),
+                            x2=int(bx2 * scale_x),
+                            y2=int(by2 * scale_y),
                         ))
             else:
                 # Fallback to line-level output
