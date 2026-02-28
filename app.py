@@ -31,7 +31,7 @@ ocr_engine = None
 # Thread pool for concurrent OCR — set to match vCPUs
 thread_pool = ThreadPoolExecutor(max_workers=4)
 
-MAX_IMAGE_SIZE = 2000
+MAX_IMAGE_SIZE = 1200
 
 
 @app.on_event("startup")
